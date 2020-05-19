@@ -11,7 +11,7 @@ use core::{
 };
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use winapi::{
     shared::{
@@ -32,6 +32,7 @@ use winapi::{
 const STATE_UNPARKED: usize = 0;
 const STATE_PARKED: usize = 1;
 const STATE_TIMED_OUT: usize = 2;
+const STATE_UNPARK_OVER: usize = 2;
 
 #[allow(non_snake_case)]
 pub struct KeyedEvent {
@@ -58,7 +59,20 @@ impl KeyedEvent {
 
     #[inline]
     unsafe fn release(&self, key: PVOID) -> NTSTATUS {
-        (self.NtReleaseKeyedEvent)(self.handle, key, 0, ptr::null_mut())
+        // println!(
+        //     "debug===> release start {:?}:{:?} {:?}",
+        //     std::file!(),
+        //     std::line!(),
+        //     std::thread::current().id()
+        // );
+        let ret = (self.NtReleaseKeyedEvent)(self.handle, key, 0, ptr::null_mut());
+        // println!(
+        //     "debug===> release end {:?}:{:?} {:?}",
+        //     std::file!(),
+        //     std::line!(),
+        //     std::thread::current().id()
+        // );
+        return ret;
     }
 
     #[allow(non_snake_case)]
@@ -112,6 +126,7 @@ impl KeyedEvent {
 
     #[inline]
     pub fn prepare_park(&'static self, key: &AtomicUsize) {
+        // println!("debug==> {:?}", "prepark_park");
         key.store(STATE_PARKED, Ordering::Relaxed);
     }
 
@@ -122,19 +137,39 @@ impl KeyedEvent {
 
     #[inline]
     pub unsafe fn park(&'static self, key: &AtomicUsize) {
+        println!("debug===> {:?}:{:?}", std::file!(), std::line!());
         let status = self.wait_for(key as *const _ as PVOID, ptr::null_mut());
+        println!("debug==>  {:?}:{:?}",std::file!(),std::line!());
         debug_assert_eq!(status, STATUS_SUCCESS);
     }
 
     #[inline]
+    pub unsafe fn park_for_release(&'static self, key: &AtomicUsize) {
+        println!("debug==> park for release ");
+
+        self.park(key);
+        // let mut nt_timeout = to_nt_time(Duration::from_nanos(100)).unwrap();
+        // let status = self.wait_for(key as *const _ as PVOID, &mut nt_timeout);
+        // if status!=STATUS_SUCCESS {
+        //     println!("debug==> park for release timeout???");
+        // }
+        // debug_assert_eq!(status, STATUS_SUCCESS);
+    }
+
+    #[inline]
     pub unsafe fn park_until(&'static self, key: &AtomicUsize, timeout: Instant) -> bool {
+        println!("debug===> park_until {:?}", std::thread::current().id());
         let now = Instant::now();
+        // println!("debug===> keyevent park_util {:?} {:?}", now, timeout);
         if timeout <= now {
+            // println!("debug===> timeout<=now",);
             // If another thread unparked us, we need to call
             // NtWaitForKeyedEvent otherwise that thread will stay stuck at
             // NtReleaseKeyedEvent.
             if key.swap(STATE_TIMED_OUT, Ordering::Relaxed) == STATE_UNPARKED {
-                self.park(key);
+                println!("debug==> {:?}:{:?}", std::file!(), std::line!());
+                self.park_for_release(key);
+               println!("debug==>  {:?}:{:?}",std::file!(),std::line!()); 
                 return true;
             }
             return false;
@@ -142,21 +177,21 @@ impl KeyedEvent {
 
         // NT uses a timeout in units of 100ns. We use a negative value to
         // indicate a relative timeout based on a monotonic clock.
-        let mut nt_timeout: LARGE_INTEGER = mem::zeroed();
         let diff = timeout - now;
-        let value = (diff.as_secs() as i64)
-            .checked_mul(-10000000)
-            .and_then(|x| x.checked_sub((diff.subsec_nanos() as i64 + 99) / 100));
+        // // println!("debug===> diff {:?} secs {:?}", diff, diff.as_secs());
+        // let value = (diff.as_secs() as i64)
+        //     .checked_mul(-10000000)
+        //     .and_then(|x| x.checked_sub((diff.subsec_nanos() as i64 + 99) / 100));
 
-        match value {
-            Some(x) => *nt_timeout.QuadPart_mut() = x,
-            None => {
-                // Timeout overflowed, just sleep indefinitely
-                self.park(key);
-                return true;
-            }
+        let mut nt_timeout = if let Some(nt_timeout) = to_nt_time(diff) {
+            nt_timeout
+        } else {
+            // Timeout overflowed, just sleep indefinitely
+            self.park(key);
+
+            return true;
         };
-
+      // println!("debug===> {:?} {:?}", std::file!(), std::line!());
         let status = self.wait_for(key as *const _ as PVOID, &mut nt_timeout);
         if status == STATUS_SUCCESS {
             return true;
@@ -166,9 +201,15 @@ impl KeyedEvent {
         // If another thread unparked us, we need to call NtWaitForKeyedEvent
         // otherwise that thread will stay stuck at NtReleaseKeyedEvent.
         if key.swap(STATE_TIMED_OUT, Ordering::Relaxed) == STATE_UNPARKED {
-            self.park(key);
+            // println!("debug===> park xxxx ",);
+
+            self.park_for_release(key);
+
+          // println!("debug===> {:?}:{:?} {:?}", status, std::file!(), std::line!());
             return true;
         }
+
+      // println!("debug===> {:?} {:?}", std::file!(), std::line!());
         false
     }
 
@@ -176,11 +217,17 @@ impl KeyedEvent {
     pub unsafe fn unpark_lock(&'static self, key: &AtomicUsize) -> UnparkHandle {
         // If the state was STATE_PARKED then we need to wake up the thread
         if key.swap(STATE_UNPARKED, Ordering::Relaxed) == STATE_PARKED {
+          // println!("debug===> unpark lock has park {:?}:{:?}", std::file!(), std::line!());
             UnparkHandle {
                 key: key,
                 keyed_event: self,
             }
         } else {
+            println!(
+                "debug===> unpark lock has no park {:?}:{:?}",
+                std::file!(),
+                std::line!()
+            );
             UnparkHandle {
                 key: ptr::null(),
                 keyed_event: self,
@@ -199,6 +246,18 @@ impl Drop for KeyedEvent {
     }
 }
 
+fn to_nt_time(dur: std::time::Duration) -> Option<LARGE_INTEGER> {
+    // println!("debug===> diff {:?} secs {:?}", dur, dur.as_secs());
+    let value = (dur.as_secs() as i64)
+        .checked_mul(-10000000)
+        .and_then(|x| x.checked_sub((dur.subsec_nanos() as i64 + 99) / 100))
+        .map(|x| {
+            let mut nt_timeout: LARGE_INTEGER = unsafe { mem::zeroed() };
+            unsafe { *nt_timeout.QuadPart_mut() = x };
+            nt_timeout
+        });
+    return value;
+}
 // Handle for a thread that is about to be unparked. We need to mark the thread
 // as unparked while holding the queue lock, but we delay the actual unparking
 // until after the queue lock is released.
@@ -212,8 +271,11 @@ impl UnparkHandle {
     // released to avoid blocking the queue for too long.
     #[inline]
     pub unsafe fn unpark(self) {
+      // println!("debug===> unpark {:?}:{:?}", std::file!(), std::line!());
         if !self.key.is_null() {
+            println!("debug===> unpark call release {:?}:{:?}", std::file!(), std::line!());
             let status = self.keyed_event.release(self.key as PVOID);
+            println!("debug==>  {:?}:{:?}",std::file!(),std::line!());
             debug_assert_eq!(status, STATUS_SUCCESS);
         }
     }
